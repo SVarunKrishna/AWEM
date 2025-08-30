@@ -1,0 +1,167 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import hashlib
+import random
+from qiskit import QuantumCircuit, transpile
+from qiskit_aer import AerSimulator
+from scipy.stats import entropy
+
+# --- Parameters ---
+NUM_BITS = 10
+ENABLE_EAVESDROPPER = True
+
+# --- Core Functions ---
+def generate_random_bits(n):
+    return [random.randint(0, 1) for _ in range(n)]
+
+def generate_random_bases(n):
+    return [random.choice(['Z', 'X']) for _ in range(n)]
+
+def adaptive_hadamard(qc, bits, bases):
+    for i in range(len(bits)):
+        if bits[i] == 1:
+            qc.x(i)
+        if bases[i] == 'X':
+            qc.h(i)
+
+def entangle_all(qc, trigger=0):
+    for i in range(1, NUM_BITS):
+        qc.cx(trigger, i)
+
+def simulate_eavesdropper(qc, eve_bases):
+    for i, base in enumerate(eve_bases):
+        if base == 'X':
+            qc.h(i)
+        qc.measure(i, i)
+        qc.reset(i)
+        if base == 'X':
+            qc.h(i)
+
+def measure_with_bases(qc, bases):
+    for i, base in enumerate(bases):
+        if base == 'X':
+            qc.h(i)
+        qc.measure(i, i)
+
+def calculate_qber(alice, bob):
+    errors = sum(a != b for a, b in zip(alice, bob))
+    return errors / len(alice) if alice else 0
+
+def logic_gates(a, b):
+    xor_out = [x ^ y for x, y in zip(a, b)]
+    and_out = [x & y for x, y in zip(a, b)]
+    or_out  = [x | y for x, y in zip(a, b)]
+    return xor_out, and_out, or_out
+
+def awem_filter(a, b):
+    return [x for x, y in zip(a, b) if x == y]
+
+def privacy_amplify(key):
+    s = ''.join(str(b) for b in key)
+    digest = hashlib.sha256(s.encode()).hexdigest()
+    return [int(b) for b in bin(int(digest, 16))[2:].zfill(256)]
+
+def shannon_entropy(bits):
+    p = [bits.count(b)/len(bits) for b in set(bits)]
+    return entropy(p, base=2)
+
+# --- CHSH Bell Test ---
+def chsh_basis(qc, qubit, basis):
+    if basis == 'X': qc.h(qubit)
+    elif basis == 'D': qc.h(qubit); qc.sdg(qubit)
+    elif basis == 'A': qc.h(qubit); qc.s(qubit)
+
+def entangled_pair():
+    qc = QuantumCircuit(2)
+    qc.h(0)
+    qc.cx(0, 1)
+    return qc
+
+def run_chsh_test():
+    settings = [('Z','D'), ('Z','A'), ('X','D'), ('X','A')]
+    sim = AerSimulator()
+    results = {}
+    for a, b in settings:
+        qc = entangled_pair()
+        chsh_basis(qc, 0, a)
+        chsh_basis(qc, 1, b)
+        qc.measure_all()
+        job = sim.run(transpile(qc, sim), shots=1024).result()
+        results[(a,b)] = job.get_counts()
+    return results
+
+def compute_s(results):
+    def corr(counts):
+        total = sum(counts.values())
+        c = 0
+        for bit, count in counts.items():
+            if bit[0] == bit[1]:
+                c += count
+            else:
+                c -= count
+        return c / total
+    E = {s: corr(results[s]) for s in results}
+    S = abs(E[('Z','D')] + E[('Z','A')] + E[('X','D')] - E[('X','A')])
+    return S
+
+# --- Main Simulation ---
+def simulate_awem_qkd():
+    print("\n--- AWEM-QKD Simulation ---")
+
+    alice_bits = generate_random_bits(NUM_BITS)
+    alice_bases = generate_random_bases(NUM_BITS)
+    bob_bases = generate_random_bases(NUM_BITS)
+    eve_bases = generate_random_bases(NUM_BITS) if ENABLE_EAVESDROPPER else []
+
+    qc = QuantumCircuit(NUM_BITS, NUM_BITS)
+    adaptive_hadamard(qc, alice_bits, alice_bases)
+    entangle_all(qc)
+
+    if ENABLE_EAVESDROPPER:
+        simulate_eavesdropper(qc, eve_bases)
+
+    measure_with_bases(qc, bob_bases)
+
+    # Show the Circuit
+    print("\n--- Quantum Circuit Diagram ---")
+    print(qc.draw(output='text'))  # ASCII in terminal
+    qc.draw(output='mpl')          # Optional matplotlib
+    plt.show()
+
+    sim = AerSimulator()
+    compiled = transpile(qc, sim)
+    result = sim.run(compiled, shots=1, memory=True).result()
+    bob_bits = [int(bit) for bit in result.get_memory()[0][::-1]]
+
+    # Sifting
+    sifted_alice, sifted_bob = [], []
+    for i in range(NUM_BITS):
+        if alice_bases[i] == bob_bases[i]:
+            sifted_alice.append(alice_bits[i])
+            sifted_bob.append(bob_bits[i])
+
+    xor_out, and_out, or_out = logic_gates(sifted_alice, sifted_bob)
+    mitigated = awem_filter(sifted_alice, sifted_bob)
+    final_key = privacy_amplify(mitigated)
+
+    qber = calculate_qber(sifted_alice, sifted_bob)
+    entropy_val = shannon_entropy(sifted_bob)
+    eavesdrop = qber > 0.2 or entropy_val < 0.9
+
+    chsh_results = run_chsh_test()
+    s_val = compute_s(chsh_results)
+    privacy_passed = s_val > 2 and qber < 0.11 and entropy_val > 0.9
+
+    # --- Terminal Output ---
+    print("Alice Sifted Key:   ", sifted_alice)
+    print("Bob Sifted Key:     ", sifted_bob)
+    print("XOR Output:         ", xor_out)
+    print("AND Output:         ", and_out)
+    print("OR Output:          ", or_out)
+    print("Mitigated Key:      ", mitigated)
+    print("Final Secure Key:   ", final_key[:32], "... (truncated)")
+   
+
+# --- Run ---
+if __name__ == "__main__":
+    simulate_awem_qkd()
