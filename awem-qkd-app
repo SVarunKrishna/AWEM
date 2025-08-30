@@ -1,0 +1,739 @@
+# awem_qkd_app.py
+# AWEM-QKD web app with interactive simulation, charts, explanations, and autosave
+# Runs your QAH + QCEL + AWEM + CHSH flow and visualizes QBER, Entropy, S-value
+# Added UI/UX: Loading spinner, gauges, transmission animation
+
+import os, json, math, random, hashlib, numpy as np
+from datetime import datetime
+from scipy.stats import entropy
+from typing import List, Tuple, Dict
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from dash import Dash, html, dcc, Input, Output, State, callback_context, dash_table
+
+# Qiskit
+from qiskit import QuantumCircuit, transpile
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+
+# -----------------------------
+# Config & output directories
+# -----------------------------
+DEFAULT_NUM_BITS = 29
+DEFAULT_NUM_SIMULATIONS = 5
+DEFAULT_ENABLE_EVE = True
+DEFAULT_MAX_RETRIES = 3
+
+OUTPUT_DIR = "simulation_outputs"
+CHART_DIR = os.path.join(OUTPUT_DIR, "charts")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(CHART_DIR, exist_ok=True)
+
+# Detect kaleido availability (for PNG export)
+try:
+    import kaleido  # noqa: F401
+    KALEIDO_OK = True
+except Exception:
+    KALEIDO_OK = False
+
+# -----------------------------
+# Noise model (same as your code)
+# -----------------------------
+def make_noise_model(single_p=0.005, two_p=0.01):
+    noise_model = NoiseModel()
+    single_qubit_error = depolarizing_error(single_p, 1)
+    two_qubit_error = depolarizing_error(two_p, 2)
+    noise_model.add_all_qubit_quantum_error(single_qubit_error, ['h', 'x'])
+    noise_model.add_all_qubit_quantum_error(two_qubit_error, ['cx'])
+    return noise_model
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def generate_random_bits(n): return [random.randint(0, 1) for _ in range(n)]
+def generate_random_bases(n): return [random.choice(['Z', 'X']) for _ in range(n)]
+def mark_decoys(bits, p=0.1): return [random.random() < p for _ in bits]
+
+def apply_qah(qc, bits, bases, num_bits):
+    for i in range(num_bits):
+        if bits[i] == 1: qc.x(i)
+        if bases[i] == 'X': qc.h(i)
+
+def apply_qcel(qc, num_bits):
+    for i in range(1, num_bits):
+        qc.cx(0, i)
+
+def insert_eavesdropper(qc, eve_bases, num_bits):
+    for i in range(num_bits):
+        if eve_bases[i] == 'X': qc.h(i)
+        qc.measure(i, i)
+        qc.reset(i)
+        if eve_bases[i] == 'X': qc.h(i)
+
+def apply_measurement(qc, bases, num_bits):
+    for i in range(num_bits):
+        if bases[i] == 'X': qc.h(i)
+        qc.measure(i, i)
+
+def awem_filter(alice, bob):
+    return [a for a, b in zip(alice, bob) if a == b]
+
+def logic_gate_filter(alice, bob):
+    return ([a ^ b for a, b in zip(alice, bob)],
+            [a & b for a, b in zip(alice, bob)],
+            [a | b for a, b in zip(alice, bob)])
+
+def sha256_amplify(key):
+    digest = hashlib.sha256(''.join(map(str, key)).encode()).hexdigest()
+    return [int(b) for b in bin(int(digest, 16))[2:].zfill(256)]
+
+def qber(alice, bob):
+    return (sum(a != b for a, b in zip(alice, bob)) / len(alice)) if alice else 1.0
+
+def shannon_entropy(bits):
+    if len(bits) == 0:
+        return 0.0
+    p = [bits.count(x)/len(bits) for x in set(bits)]
+    return entropy(p, base=2)
+
+# -----------------------------
+# Cascade: realistic simulated Cascade-style error correction
+# -----------------------------
+def _parity(bits: List[int], indices: List[int]) -> int:
+    p = 0
+    for i in indices:
+        p ^= bits[i]
+    return p
+
+def _bisect_fix(alice: List[int], bob: List[int], indices: List[int]) -> int:
+    lo = 0
+    hi = len(indices) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        left_idx = indices[lo:mid+1]
+        pa = _parity(alice, left_idx)
+        pb = _parity(bob, left_idx)
+        if pa != pb:
+            hi = mid
+        else:
+            lo = mid + 1
+    flip_pos = indices[lo]
+    bob[flip_pos] ^= 1
+    return flip_pos
+
+def cascade_correct(alice: List[int], bob: List[int],
+                    max_passes: int = 4,
+                    initial_block_size: int | None = None,
+                    seed: int | None = None
+                    ) -> Tuple[List[int], Dict]:
+    """
+    Simulated Cascade-style error correction.
+    Returns (corrected_bob, stats)
+    stats: corrections, positions, passes, final_qber
+    """
+    if len(alice) != len(bob):
+        raise ValueError("Alice and Bob bit lists must have the same length for Cascade.")
+
+    n = len(alice)
+    if n == 0:
+        return bob[:], {"corrections": 0, "positions": [], "passes": 0, "final_qber": 0.0}
+
+    rng = random.Random(seed)
+    corrected_bob = bob[:]  # copy
+    total_corrections = 0
+    correction_positions = []
+
+    if initial_block_size is None:
+        initial_block_size = max(1, n // (2 ** (max_passes - 1))) if max_passes > 1 else max(1, n // 2)
+
+    for p in range(max_passes):
+        # random permutation for this pass
+        perm = list(range(n))
+        rng.shuffle(perm)
+
+        block_size = initial_block_size * (2 ** p)
+        block_size = max(1, min(block_size, n))
+        blocks = [perm[i:i + block_size] for i in range(0, n, block_size)]
+
+        i = 0
+        while i < len(blocks):
+            indices = blocks[i]
+            if _parity(alice, indices) != _parity(corrected_bob, indices):
+                fixed_pos = _bisect_fix(alice, corrected_bob, indices)
+                total_corrections += 1
+                correction_positions.append(fixed_pos)
+                # recheck previous block to simulate interactivity
+                i = max(0, i - 1)
+            else:
+                i += 1
+
+    mismatches = sum(a != b for a, b in zip(alice, corrected_bob))
+    final_qber = mismatches / n if n else 0.0
+    stats = {
+        "corrections": total_corrections,
+        "positions": correction_positions,
+        "passes": max_passes,
+        "final_qber": final_qber
+    }
+    return corrected_bob, stats
+
+# -----------------------------
+# CHSH (same as your code)
+# -----------------------------
+def chsh_measure_circuit(angle_a, angle_b):
+    qc = QuantumCircuit(2, 2)
+    qc.h(0); qc.cx(0, 1)
+    qc.ry(2*angle_a, 0)
+    qc.ry(2*angle_b, 1)
+    qc.measure([0, 1], [0, 1])
+    return qc
+
+def chsh_test_on_circuit(noise_model):
+    sim = AerSimulator(noise_model=noise_model)
+    shots = 2048
+    angles = {
+        'A0': 0,
+        'A1': np.pi/4,
+        'B0': np.pi/8,
+        'B1': -np.pi/8
+    }
+    def get_corr(angle_a, angle_b):
+        qc = chsh_measure_circuit(angle_a, angle_b)
+        result = sim.run(transpile(qc, sim), shots=shots).result()
+        counts = result.get_counts()
+        total = sum(counts.values())
+        same = counts.get('00', 0) + counts.get('11', 0)
+        diff = counts.get('01', 0) + counts.get('10', 0)
+        return (same - diff) / total if total else 0.0
+
+    E = {
+        'A0B0': get_corr(angles['A0'], angles['B0']),
+        'A0B1': get_corr(angles['A0'], angles['B1']),
+        'A1B0': get_corr(angles['A1'], angles['B0']),
+        'A1B1': get_corr(angles['A1'], angles['B1']),
+    }
+    S = abs(E['A0B0'] + E['A0B1'] + E['A1B0'] - E['A1B1'])
+    return round(S, 4)
+
+# -----------------------------
+# Core simulation (adapted to be parametric)
+# -----------------------------
+def run_one_awem_qkd_sim(run_id, num_bits, enable_eve, max_retries, noise_model):
+    retry = 0
+    while retry < max_retries:
+        alice_bits = generate_random_bits(num_bits)
+        alice_bases = generate_random_bases(num_bits)
+        bob_bases   = generate_random_bases(num_bits)
+        eve_bases   = generate_random_bases(num_bits) if enable_eve else []
+        decoys      = mark_decoys(alice_bits)
+
+        qc = QuantumCircuit(num_bits, num_bits)
+        apply_qah(qc, alice_bits, alice_bases, num_bits)
+        apply_qcel(qc, num_bits)
+        if enable_eve:
+            insert_eavesdropper(qc, eve_bases, num_bits)
+        apply_measurement(qc, bob_bases, num_bits)
+
+        sim = AerSimulator(noise_model=noise_model)
+        result = sim.run(transpile(qc, sim), shots=1, memory=True).result()
+        bob_bits = [int(x) for x in result.get_memory()[0][::-1]]
+
+        # sift by basis match and not decoy
+        sifted_alice = [alice_bits[i] for i in range(num_bits) if alice_bases[i] == bob_bases[i] and not decoys[i]]
+        sifted_bob   = [bob_bits[i]   for i in range(num_bits) if alice_bases[i] == bob_bases[i] and not decoys[i]]
+
+        xor_g, and_g, or_g = logic_gate_filter(sifted_alice, sifted_bob)
+
+        # Use the realistic Cascade implementation
+        corrected, cascade_stats = cascade_correct(sifted_alice, sifted_bob, max_passes=4, seed=None)
+
+        mitigated  = awem_filter(sifted_alice, corrected)
+        final_key  = sha256_amplify(mitigated)
+
+        # Use corrected bits to compute metrics. final_qber from cascade_stats is available.
+        err   = cascade_stats.get("final_qber", qber(sifted_alice, corrected))
+        ent   = shannon_entropy(corrected)
+        s_val = chsh_test_on_circuit(noise_model)
+        passed = (err < 0.25) and (ent > 0.85) and (s_val > 2.0)
+
+        # Prepare a concise record for UI
+        record = {
+            "run_id": run_id,
+            "retry_used": retry + 1,
+            "qber": err,
+            "entropy": ent,
+            "s_value": s_val,
+            "privacy_passed": bool(passed),
+            "secure_key_len": len(final_key),
+            "alice_sifted": sifted_alice[:64],  # short preview
+            "bob_sifted": corrected[:64],       # short preview
+            "xor": xor_g[:32],
+            "and": and_g[:32],
+            "or":  or_g[:32],
+            "mitigated": mitigated[:64],
+            "final_key_preview": final_key[:64],
+            # Cascade stats
+            "corrections_count": cascade_stats.get("corrections", 0),
+            "corrections_positions": cascade_stats.get("positions", [])[:128],
+            "cascade_passes": cascade_stats.get("passes", 0),
+        }
+
+        if passed or retry == max_retries - 1:
+            return record
+        retry += 1
+
+def run_all_sims(num_sims, num_bits, enable_eve, max_retries, single_p, two_p):
+    noise_model = make_noise_model(single_p=single_p, two_p=two_p)
+    records = []
+    for i in range(1, num_sims + 1):
+        rec = run_one_awem_qkd_sim(i, num_bits, enable_eve, max_retries, noise_model)
+        records.append(rec)
+        # also write per-run JSON for traceability
+        per_run_path = os.path.join(OUTPUT_DIR, f"awem_results_run_{i}.json")
+        with open(per_run_path, "w") as jf:
+            json.dump(rec, jf, indent=4)
+    return records
+
+# -----------------------------
+# Visualization helpers
+# -----------------------------
+def make_summary_df(records):
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame([{
+        "Run": r["run_id"],
+        "RetriesUsed": r["retry_used"],
+        "QBER": r["qber"],
+        "Entropy": r["entropy"],
+        "S_value": r["s_value"],
+        "PrivacyPassed": r["privacy_passed"],
+        "SecureKeyLen": r["secure_key_len"]
+    } for r in records])
+    return df
+
+def fig_metrics(df):
+    if df.empty:
+        return go.Figure()
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        subplot_titles=("QBER per Run", "Entropy per Run", "CHSH S-value per Run"))
+    fig.add_trace(go.Scatter(x=df["Run"], y=df["QBER"], mode="lines+markers", name="QBER"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["Run"], y=df["Entropy"], mode="lines+markers", name="Entropy"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df["Run"], y=df["S_value"], mode="lines+markers", name="S-value"), row=3, col=1)
+
+    # add thresholds
+    fig.add_hline(y=0.25, line_dash="dot", line_color="red", row=1, col=1)
+    fig.add_hline(y=0.85, line_dash="dot", line_color="orange", row=2, col=1)
+    fig.add_hline(y=2.0,  line_dash="dot", line_color="green", row=3, col=1)
+
+    fig.update_layout(height=800, margin=dict(l=50, r=30, t=60, b=40), legend=dict(orientation="h"))
+    return fig
+
+def fig_privacy_pie(df):
+    if df.empty:
+        return go.Figure()
+    counts = df["PrivacyPassed"].value_counts()
+    labels = ["Passed", "Failed"]
+    values = [int(counts.get(True, 0)), int(counts.get(False, 0))]
+    fig = go.Figure(go.Pie(labels=labels, values=values, hole=0.4))
+    fig.update_layout(title_text="Privacy Check Outcome")
+    return fig
+
+def save_pngs(figs_with_names):
+    if not KALEIDO_OK:
+        return "PNG export skipped (install 'kaleido' to enable)."
+    messages = []
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for name, fig in figs_with_names:
+        path = os.path.join(CHART_DIR, f"{name}_{ts}.png")
+        try:
+            fig.write_image(path, scale=2, width=1200, height=800)
+            messages.append(f"Saved: {path}")
+        except Exception as e:
+            messages.append(f"Failed to save {name}: {e}")
+    return "\n".join(messages) if messages else "No figures to save."
+
+# -----------------------------
+# Dash App UI
+# -----------------------------
+app = Dash(__name__, suppress_callback_exceptions=True)
+app.title = "AWEM-QKD Demo"
+
+app.layout = html.Div([
+    html.H1("AWEM-QKD: Adaptive Window Error Mitigation – Quantum Key Distribution"),
+    html.Div([
+        html.Div([
+            html.H3("Simulation Controls"),
+            html.Label("Number of Bits (NUM_BITS)"),
+            dcc.Slider(8, 64, 1, value=DEFAULT_NUM_BITS, id="bits", tooltip={"always_visible": True}),
+            html.Br(),
+
+            html.Label("Number of Simulations (Runs)"),
+            dcc.Slider(1, 15, 1, value=DEFAULT_NUM_SIMULATIONS, id="runs", tooltip={"always_visible": True}),
+            html.Br(),
+
+            html.Label("Max Retries per Run"),
+            dcc.Slider(1, 5, 1, value=DEFAULT_MAX_RETRIES, id="retries", tooltip={"always_visible": True}),
+            html.Br(),
+
+            html.Label("Enable Eavesdropper (Eve)"),
+            dcc.RadioItems(
+                id="eve",
+                options=[{"label": "Enabled", "value": True}, {"label": "Disabled", "value": False}],
+                value=DEFAULT_ENABLE_EVE, inline=True
+            ),
+            html.Br(),
+
+            html.Label("Noise (Depolarizing) – 1q"),
+            dcc.Slider(0.0, 0.05, 0.001, value=0.005, id="noise1q", tooltip={"always_visible": True}),
+            html.Label("Noise (Depolarizing) – 2q"),
+            dcc.Slider(0.0, 0.10, 0.001, value=0.01, id="noise2q", tooltip={"always_visible": True}),
+
+            html.Br(),
+            html.Button("▶ Run AWEM-QKD", id="run_btn", n_clicks=0),
+            dcc.Loading(
+                id="loading-run",
+                type="circle",
+                color="#119DFF",
+                children=html.Div(id="run_msg", style={"marginTop": "0.6rem", "color": "#444"})
+            )
+        ], className="control", style={"flex": "1", "paddingRight": "20px", "minWidth": "320px"}),
+
+        html.Div([
+            html.H3("AWEM-QKD Walkthrough"),
+            dcc.Markdown("""
+**QAH (Quantum Adaptive Hadamard)**  
+- Encodes Alice bits with X for 1s; applies H for X-basis prep.
+
+**QCEL (Quantum Conditional Entanglement Logic)**  
+- Entangles qubits by chaining CNOTs from q0 → all others.
+
+**Eavesdropper Model (Optional)**  
+- Eve randomly measures in Z/X, collapses + resets, re-prepares (simulates intercept-resend).
+
+**Sifting + Logic Gates**  
+- Keep positions where Alice/Bob bases match & not decoy.  
+- XOR/AND/OR on sifted bits are visual diagnostics.
+
+**Cascade-style Correction (simulated Cascade)**  
+- Uses block parity checks, bisection and multiple passes with permutations.
+
+**AWEM Filter**  
+- Keep positions where post-correction bits agree.
+
+**CHSH Test**  
+- Generate entanglement on 2 qubits with optimal angles; S > 2 implies Bell violation.
+
+**Privacy Decision**  
+- ✅ if QBER < 0.25 & Entropy > 0.85 & S > 2.0  
+- Final key is SHA-256 amplified (256 bits).
+            """)
+        ], className="explain", style={"flex": "1", "minWidth": "320px"})
+    ], style={"display": "flex", "gap": "24px", "flexWrap": "wrap"}),
+
+    html.Hr(),
+
+    dcc.Store(id="records_store"),
+
+    html.Div([
+        html.H3("Results Summary"),
+        html.Div(id="summary_bar"),
+        dash_table.DataTable(
+            id="summary_table",
+            columns=[{"name": c, "id": c} for c in ["Run","RetriesUsed","QBER","Entropy","S_value","PrivacyPassed","SecureKeyLen"]],
+            data=[],
+            page_size=10,
+            style_cell={"textAlign": "center"},
+            style_header={"fontWeight": "bold"},
+            style_table={"overflowX": "auto"}
+        )
+    ], style={"marginTop": "10px"}),
+
+    # Metrics & Privacy
+    html.Div([
+        html.H3("Metrics Timeline"),
+        dcc.Graph(id="metrics_fig"),
+        html.H3("Privacy Outcome"),
+        dcc.Graph(id="privacy_fig"),
+    ], style={"marginBottom": "24px"}),
+
+    # New: gauges
+    html.Div([
+        html.H3("Interactive Gauges"),
+        html.Div([
+            dcc.Graph(id="gauge_qber", style={"flex": "1", "minWidth": "250px"}),
+            dcc.Graph(id="gauge_entropy", style={"flex": "1", "minWidth": "250px"}),
+            dcc.Graph(id="gauge_svalue", style={"flex": "1", "minWidth": "250px"}),
+        ], style={"display": "flex", "gap": "20px", "flexWrap": "wrap"})
+    ], style={"marginBottom": "24px"}),
+
+    # New: transmission animation
+    html.Div([
+        html.H3("Quantum Transmission Animation"),
+        dcc.Graph(id="transmission_anim", style={"height": "420px"})
+    ], style={"marginBottom": "24px"}),
+
+    html.Div([
+        html.H3("Per-Run Key Snapshots"),
+        html.Div(id="key_previews")
+    ], style={"marginBottom": "24px"}),
+
+    html.Div(id="save_msg", style={"whiteSpace": "pre-wrap", "color": "#226622", "fontStyle": "italic", "marginTop": "8px"})
+], style={"maxWidth": "1200px", "margin": "0 auto", "fontFamily": "system-ui, -apple-system, Segoe UI, Roboto, Arial"})
+
+# -----------------------------
+# Callbacks
+# -----------------------------
+@app.callback(
+    Output("records_store", "data"),
+    Output("run_msg", "children"),
+    Input("run_btn", "n_clicks"),
+    State("bits", "value"),
+    State("runs", "value"),
+    State("retries", "value"),
+    State("eve", "value"),
+    State("noise1q", "value"),
+    State("noise2q", "value"),
+    prevent_initial_call=True
+)
+def on_run(n, num_bits, runs, retries, eve, n1q, n2q):
+    ctx = callback_context
+    if not ctx.triggered:
+        raise Exception("No trigger")
+    msg = f"Running {runs} simulation(s) with NUM_BITS={num_bits}, Eve={'ON' if eve else 'OFF'}, noise1q={n1q}, noise2q={n2q}…"
+    records = run_all_sims(
+        num_sims=runs,
+        num_bits=num_bits,
+        enable_eve=eve,
+        max_retries=retries,
+        single_p=float(n1q),
+        two_p=float(n2q),
+    )
+    # Also save consolidated CSV/JSON
+    df = make_summary_df(records)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(OUTPUT_DIR, f"awem_summary_{ts}.csv")
+    json_path = os.path.join(OUTPUT_DIR, f"awem_summary_{ts}.json")
+    try:
+        df.to_csv(csv_path, index=False)
+    except Exception:
+        pass
+    with open(json_path, "w") as jf:
+        json.dump(records, jf, indent=4)
+    msg += f" Saved summary to:\n- {csv_path}\n- {json_path}\n(Outputs saved under: {OUTPUT_DIR})"
+    return records, msg
+
+@app.callback(
+    Output("summary_table", "data"),
+    Output("summary_bar", "children"),
+    Output("metrics_fig", "figure"),
+    Output("privacy_fig", "figure"),
+    Output("key_previews", "children"),
+    Output("save_msg", "children"),
+    Input("records_store", "data")
+)
+def update_views(records):
+    if not records:
+        return [], "", go.Figure(), go.Figure(), [], ""
+
+    df = make_summary_df(records)
+
+    # Metrics figure
+    metrics = fig_metrics(df)
+
+    # Privacy pie
+    pie = fig_privacy_pie(df)
+
+    # Key previews (cards)
+    cards = []
+    for r in records:
+        status = "✅ SECURE" if r["privacy_passed"] else "❌ INSECURE"
+        cards.append(html.Div([
+            html.Div(f"Run #{r['run_id']} — {status}", style={"fontWeight": "bold"}),
+            html.Div(f"QBER={r['qber']:.3f} | Entropy={r['entropy']:.3f} | S={r['s_value']:.3f} | Retries={r['retry_used']}"),
+            html.Div(f"Alice Sifted: {r['alice_sifted']}"),
+            html.Div(f"Bob (Corrected): {r['bob_sifted']}"),
+            html.Div(f"Mitigated: {r['mitigated']}"),
+            html.Div(f"Final Key (SHA-256, first 64 bits): {r['final_key_preview']}"),
+            html.Div(f"Corrections: {r.get('corrections_count', 0)} positions (showing up to 128): {r.get('corrections_positions', [])}")
+        ], style={"border":"1px solid #ddd","padding":"10px","borderRadius":"10px","marginBottom":"10px","background":"#fafafa"}))
+
+    # Save figures as PNGs (if kaleido available)
+    save_report = save_pngs([
+        ("metrics", metrics),
+        ("privacy_outcome", pie)
+    ])
+
+    summary_bar = html.Div([
+        html.Div(f"Total Runs: {len(df)} | Passed: {int(df['PrivacyPassed'].sum())} | Failed: {int((~df['PrivacyPassed']).sum())}",
+                 style={"fontWeight":"bold","marginBottom":"8px"})
+    ])
+
+    return df.to_dict("records"), summary_bar, metrics, pie, cards, save_report
+
+# -----------------------------
+# New: Gauges callback
+# -----------------------------
+@app.callback(
+    Output("gauge_qber", "figure"),
+    Output("gauge_entropy", "figure"),
+    Output("gauge_svalue", "figure"),
+    Input("records_store", "data")
+)
+def update_gauges(records):
+    if not records:
+        # empty placeholder gauges
+        empty_fig = go.Figure()
+        empty_fig.update_layout(template=None)
+        return empty_fig, empty_fig, empty_fig
+    r = records[-1]  # last run
+    # QBER gauge (0..1)
+    fig_qber = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=r["qber"],
+        number={"valueformat": ".3f"},
+        gauge={
+            "axis": {"range": [0, 1]},
+            "bar": {"color": "#e45756"},
+            "steps": [
+                {"range": [0, 0.25], "color": "#d5f5e3"},
+                {"range": [0.25, 1], "color": "#fde2e2"}
+            ]
+        },
+        title={"text": "QBER"}
+    ))
+    # Entropy gauge (0..1)
+    fig_entropy = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=r["entropy"],
+        number={"valueformat": ".3f"},
+        gauge={
+            "axis": {"range": [0, 1]},
+            "bar": {"color": "#19a7ce"},
+            "steps": [
+                {"range": [0, 0.85], "color": "#fdebd0"},
+                {"range": [0.85, 1], "color": "#e8f6ef"}
+            ]
+        },
+        title={"text": "Shannon Entropy"}
+    ))
+    # S-value gauge (0..3)
+    fig_s = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=r["s_value"],
+        number={"valueformat": ".3f"},
+        gauge={
+            "axis": {"range": [0, 3]},
+            "bar": {"color": "#2ca02c"},
+            "steps": [
+                {"range": [0, 2], "color": "#fde2e2"},
+                {"range": [2, 3], "color": "#e8f6ef"}
+            ]
+        },
+        title={"text": "CHSH S-value"}
+    ))
+    for f in (fig_qber, fig_entropy, fig_s):
+        f.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=260)
+    return fig_qber, fig_entropy, fig_s
+
+# -----------------------------
+# New: Transmission animation callback (complete)
+# -----------------------------
+@app.callback(
+    Output("transmission_anim", "figure"),
+    Input("records_store", "data")
+)
+def animate_transmission(records):
+    if not records:
+        fig_empty = go.Figure()
+        fig_empty.update_layout(
+            title="Quantum Transmission (Alice → Eve → Bob)",
+            xaxis=dict(range=[-0.1, 1.1], showticklabels=False),
+            yaxis=dict(range=[-1, 1], showticklabels=False),
+            annotations=[{"text": "Run a simulation to see the animation",
+                          "x": 0.5, "y": 0, "showarrow": False}]
+        )
+        return fig_empty
+
+    bits = records[0].get("alice_sifted", [])[:12]
+    num_bits = len(bits)
+    if num_bits == 0:
+        fig_no_bits = go.Figure()
+        fig_no_bits.update_layout(
+            title="Quantum Transmission (Alice → Eve → Bob)",
+            xaxis=dict(range=[-0.1, 1.1], showticklabels=False),
+            yaxis=dict(range=[-1, 1], showticklabels=False),
+            annotations=[{"text": "No sifted bits in this run to animate",
+                          "x": 0.5, "y": 0, "showarrow": False}]
+        )
+        return fig_no_bits
+
+    frames = []
+    x_positions = [0, 0.5, 1.0]  # Alice, Eve, Bob
+    for i, bit in enumerate(bits):
+        color = "royalblue" if bit == 0 else "orange"
+        frames.append(go.Frame(
+            name=f"bit{i}_a",
+            data=[go.Scatter(x=[x_positions[0]], y=[0],
+                             mode="markers+text",
+                             text=[str(bit)], textposition="top center",
+                             marker=dict(size=18, color=color,
+                                         line=dict(width=2, color="black")))]
+        ))
+        frames.append(go.Frame(
+            name=f"bit{i}_e",
+            data=[go.Scatter(x=[x_positions[1]], y=[0],
+                             mode="markers+text",
+                             text=[str(bit)], textposition="top center",
+                             marker=dict(size=22, color=color,
+                                         line=dict(width=3, color="black")))]
+        ))
+        frames.append(go.Frame(
+            name=f"bit{i}_b",
+            data=[go.Scatter(x=[x_positions[2]], y=[0],
+                             mode="markers+text",
+                             text=[str(bit)], textposition="top center",
+                             marker=dict(size=18, color=color,
+                                         line=dict(width=2, color="black")))]
+        ))
+
+    fig = go.Figure(
+        data=[go.Scatter(x=[], y=[], mode="markers")],
+        frames=frames,
+        layout=go.Layout(
+            title="Quantum Transmission (Alice → Eve → Bob)",
+            xaxis=dict(range=[-0.1, 1.1], showticklabels=False),
+            yaxis=dict(range=[-1, 1], showticklabels=False),
+            showlegend=False,
+            annotations=[
+                {"text": "Alice", "x": 0, "y": -0.5, "showarrow": False},
+                {"text": "Eve", "x": 0.5, "y": -0.5, "showarrow": False},
+                {"text": "Bob", "x": 1.0, "y": -0.5, "showarrow": False}
+            ],
+            updatemenus=[{
+                "type": "buttons",
+                "buttons": [
+                    {"label": "▶ Play", "method": "animate",
+                     "args": [None,
+                              {"frame": {"duration": 600, "redraw": True},
+                               "fromcurrent": True, "mode": "immediate"}]},
+                    {"label": "⏸ Pause", "method": "animate",
+                     "args": [[None],
+                              {"frame": {"duration": 0, "redraw": False},
+                               "mode": "immediate"}]}
+                ],
+                "x": 0.5, "y": -0.3, "xanchor": "center"
+            }]
+        )
+    )
+    return fig
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__ == "__main__":
+    print("Starting AWEM-QKD web app…")
+    print("Open http://127.0.0.1:8050/ in your browser.")
+    app.run(debug=True)
