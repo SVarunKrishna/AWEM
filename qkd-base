@@ -1,0 +1,151 @@
+import random
+import hashlib
+import csv
+from datetime import datetime
+from qiskit import QuantumCircuit, transpile
+from qiskit_aer import AerSimulator
+import numpy as np
+
+# Configs
+NUM_BITS = 100
+SHOTS = 1024
+ENABLE_EAVESDROPPER = True
+CSV_EXPORT = True
+
+def random_bits(n): return [random.randint(0, 1) for _ in range(n)]
+def random_bases(n): return [random.choice(['Z', 'X']) for _ in range(n)]
+
+def bb84_simulation():
+    alice_bits = random_bits(NUM_BITS)
+    alice_bases = random_bases(NUM_BITS)
+    bob_bases = random_bases(NUM_BITS)
+
+    # Encode and send qubits
+    simulator = AerSimulator()
+    bob_results = []
+
+    for bit, a_basis, b_basis in zip(alice_bits, alice_bases, bob_bases):
+        qc = QuantumCircuit(1, 1)
+        if bit == 1:
+            qc.x(0)
+        if a_basis == 'X':
+            qc.h(0)
+
+        if ENABLE_EAVESDROPPER:
+            eve_basis = random.choice(['Z', 'X'])
+            if eve_basis == 'X':
+                qc.h(0)
+            qc.measure(0, 0)
+            qc.reset(0)
+            if eve_basis == 'X':
+                qc.h(0)
+
+        if b_basis == 'X':
+            qc.h(0)
+        qc.measure(0, 0)
+
+        transpiled = transpile(qc, simulator)
+        result = simulator.run(transpiled, shots=1, memory=True).result()
+        measured_bit = int(result.get_memory()[0])
+        bob_results.append(measured_bit)
+
+    # Key sifting
+    sifted_alice, sifted_bob = [], []
+    for i in range(NUM_BITS):
+        if alice_bases[i] == bob_bases[i]:
+            sifted_alice.append(alice_bits[i])
+            sifted_bob.append(bob_results[i])
+
+    # QBER
+    errors = sum(a != b for a, b in zip(sifted_alice, sifted_bob))
+    qber = errors / len(sifted_alice) if sifted_alice else 0
+
+    # Entropy
+    p0 = sifted_bob.count(0) / len(sifted_bob) if sifted_bob else 0.5
+    p1 = 1 - p0
+    entropy_val = -(p0 * np.log2(p0) + p1 * np.log2(p1)) if p0 and p1 else 0
+
+    # Eavesdropper detection
+    eavesdropper_detected = qber > 0.2 or entropy_val < 0.9
+
+    # Privacy Amplification
+    key_str = ''.join(map(str, sifted_bob))
+    secure_key = hashlib.sha256(key_str.encode()).hexdigest()
+
+    print(f"\nBB84 Simulation")
+    print(f"Sifted Key: {sifted_bob}")
+    print(f"QBER: {qber:.4f}")
+    print(f"Entropy: {entropy_val:.4f}")
+    print(f"Eavesdropper Detected: {eavesdropper_detected}")
+    print(f"Secure Key (SHA-256): {secure_key[:32]}...")
+
+    if CSV_EXPORT:
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open(f"bb84_result_{now}.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["QBER", "Entropy", "EavesdropperDetected", "KeyLength"])
+            writer.writerow([qber, entropy_val, eavesdropper_detected, len(secure_key)])
+
+    return qber, entropy_val, eavesdropper_detected, secure_key
+
+
+# --- E91 / CHSH Test Logic ---
+
+def chsh_measurement_basis(qc, qubit, basis):
+    if basis == 'X': qc.h(qubit)
+    elif basis == 'D': qc.h(qubit); qc.sdg(qubit)
+    elif basis == 'A': qc.h(qubit); qc.s(qubit)
+
+def create_entangled_pair():
+    qc = QuantumCircuit(2)
+    qc.h(0)
+    qc.cx(0, 1)
+    return qc
+
+def run_chsh_test():
+    settings = [('Z', 'D'), ('Z', 'A'), ('X', 'D'), ('X', 'A')]
+    results = {}
+    simulator = AerSimulator()
+
+    for a_basis, b_basis in settings:
+        qc = create_entangled_pair()
+        chsh_measurement_basis(qc, 0, a_basis)
+        chsh_measurement_basis(qc, 1, b_basis)
+        qc.measure_all()
+        job = simulator.run(transpile(qc, simulator), shots=SHOTS)
+        counts = job.result().get_counts()
+        results[(a_basis, b_basis)] = counts
+
+    return results
+
+def compute_chsh_violation(results):
+    def correlation(counts):
+        total = sum(counts.values())
+        exp = 0
+        for outcome, count in counts.items():
+            if outcome[0] == outcome[1]: exp += count
+            else: exp -= count
+        return exp / total
+
+    E = {setting: correlation(results[setting]) for setting in results}
+    S = abs(E[('Z', 'D')] + E[('Z', 'A')] + E[('X', 'D')] - E[('X', 'A')])
+    return S
+
+def e91_simulation():
+    print("\nRunning E91 CHSH Test...")
+    chsh_results = run_chsh_test()
+    S_value = compute_chsh_violation(chsh_results)
+
+    print(f"CHSH S-value: {S_value:.4f}")
+    if S_value > 2:
+        print("✅ Bell Inequality Violated — Entanglement confirmed.")
+    else:
+        print("❌ No violation — Entanglement doubtful or noisy.")
+
+    return S_value
+
+
+# --- MAIN ---
+if __name__ == "__main__":
+    bb84_simulation()
+    e91_simulation()
