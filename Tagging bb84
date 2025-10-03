@@ -1,0 +1,131 @@
+import numpy as np
+import hashlib
+from qiskit import QuantumCircuit, transpile
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel, depolarizing_error
+
+# --- 1. Experiment with these parameters! ---
+NUM_QUBITS = 200
+ERROR_PROBABILITY = 0.005  # 0.5% channel noise
+EVE_ATTACK_PERCENTAGE = 0.15 # Eve attacks 15% of qubits
+DECOY_STATE_RATIO = 0.25   # 25% of pulses are decoys
+MULTI_PHOTON_RATIO = 0.05  # 5% of pulses have multiple photons
+
+# --- 2. Setup the Simulation ---
+noise_model = NoiseModel()
+error = depolarizing_error(ERROR_PROBABILITY, 1)
+noise_model.add_all_qubit_quantum_error(error, ['u1', 'u2', 'u3', 'id', 'x', 'z'])
+print(f"🛰️  Realistic simulation enabled with a {ERROR_PROBABILITY*100}% channel error rate.")
+
+# Alice prepares bits, bases, and pulse types
+alice_bits = np.random.randint(0, 2, NUM_QUBITS)
+alice_bases = np.random.choice(['Z', 'X'], NUM_QUBITS)
+alice_pulse_types = np.random.choice(['signal', 'decoy'], size=NUM_QUBITS, p=[1-DECOY_STATE_RATIO, DECOY_STATE_RATIO])
+# Alice's laser sometimes emits multi-photon pulses
+alice_multiphoton_status = np.random.choice([False, True], size=NUM_QUBITS, p=[1-MULTI_PHOTON_RATIO, MULTI_PHOTON_RATIO])
+
+# Bob chooses his measurement bases
+bob_bases = np.random.choice(['Z', 'X'], NUM_QUBITS)
+
+# Eve's Attack Plan
+num_attacks = int(NUM_QUBITS * EVE_ATTACK_PERCENTAGE)
+attack_indices = sorted(np.random.choice(range(NUM_QUBITS), size=num_attacks, replace=False))
+print(f"🕵️  EVE: Planning targeted attacks on {len(attack_indices)} qubits.\n")
+
+# --- 3. The Quantum Phase: Circuit Creation and Execution ---
+circuits = []
+eve_pns_success_indices = [] # Indices where Eve successfully used a PNS attack
+for i in range(NUM_QUBITS):
+    qc = QuantumCircuit(1, 1, name=f'q_{i}')
+    if alice_bits[i] == 1: qc.x(0)
+    if alice_bases[i] == 'X': qc.h(0)
+    qc.barrier()
+    qc.id(0) 
+
+    # Eve's Attack Logic
+    if i in attack_indices:
+        # If it's a multi-photon pulse, Eve performs a PNS attack
+        if alice_multiphoton_status[i]:
+            eve_pns_success_indices.append(i)
+            # Eve learns the bit without disturbing the qubit that goes to Bob
+        else:
+            # On single-photon pulses, she must risk a standard attack
+            attack_type = np.random.choice(['X', 'Z'])
+            if attack_type == 'X': qc.x(0)
+            elif attack_type == 'Z': qc.z(0)
+    
+    qc.barrier()
+    if bob_bases[i] == 'X': qc.h(0)
+    qc.measure(0, 0)
+    circuits.append(qc)
+
+sim_noise = AerSimulator(noise_model=noise_model)
+t_circs = transpile(circuits, sim_noise)
+result = sim_noise.run(t_circs, shots=1, memory=True).result()
+bob_bits = [int(result.get_memory(i)[0]) for i in range(len(circuits))]
+
+# --- 4. The Classical Phase (AWEM Protocol) ---
+print("--- 📢 Public Discussion & AWEM Correction Begins ---\n")
+
+# Sifting
+sifted_indices = [i for i in range(NUM_QUBITS) if alice_bases[i] == bob_bases[i]]
+sifted_alice_bits = [alice_bits[i] for i in sifted_indices]
+sifted_bob_bits = [bob_bits[i] for i in sifted_indices]
+sifted_pulse_types = [alice_pulse_types[i] for i in sifted_indices]
+
+# **NEW: Decoy State Analysis**
+print("--- 🛡️ Decoy State Analysis ---")
+decoy_errors, decoy_total = 0, 0
+signal_errors, signal_total = 0, 0
+for i in range(len(sifted_indices)):
+    if sifted_pulse_types[i] == 'decoy':
+        decoy_total += 1
+        if sifted_alice_bits[i] != sifted_bob_bits[i]:
+            decoy_errors += 1
+    else: # 'signal'
+        signal_total += 1
+        if sifted_alice_bits[i] != sifted_bob_bits[i]:
+            signal_errors += 1
+
+qber_decoy = (decoy_errors / decoy_total) * 100 if decoy_total > 0 else 0
+qber_signal = (signal_errors / signal_total) * 100 if signal_total > 0 else 0
+
+print(f"Decoy QBER: {qber_decoy:.2f}% ({decoy_errors}/{decoy_total} errors)")
+print(f"Signal QBER: {qber_signal:.2f}% ({signal_errors}/{signal_total} errors)")
+
+# A significant difference could indicate a PNS attack
+pns_threshold = 2.0 # 2% tolerance
+if abs(qber_decoy - qber_signal) > pns_threshold and len(eve_pns_success_indices) > 0:
+    print("\n**SECURITY ALERT: QBERs differ significantly! Photon-Number-Splitting attack suspected.**")
+    print("❌ PROTOCOL ABORTED.")
+else:
+    print("\nDecoy and signal QBERs are consistent. No PNS attack detected.\n")
+    
+    # --- 5. Full Error Correction ---
+    print("--- 🛠️ Full Error Correction ---")
+    bob_corrected_key = list(sifted_bob_bits)
+    for i in range(len(sifted_alice_bits)):
+        if sifted_alice_bits[i] != sifted_bob_bits[i]:
+            bob_corrected_key[i] = 1 - sifted_alice_bits[i]
+    print(f"{decoy_errors + signal_errors} total errors found and corrected.\n")
+
+    # --- 6. Final Verification & SECURITY CHECK ---
+    print("--- ✅ Final Key Verification ---")
+    final_qber = ((decoy_errors + signal_errors) / len(sifted_indices)) * 100 if len(sifted_indices) > 0 else 0
+    print(f"**True Overall QBER: {final_qber:.2f}%**")
+
+    if final_qber > 11.0:
+        print("\n**SECURITY ALERT: QBER is above the 11% threshold.**")
+        print("❌ PROTOCOL ABORTED.")
+    else:
+        print("\nQBER is within the secure limit. Proceeding to final key generation.")
+        final_key_str = "".join(map(str, bob_corrected_key))
+        
+        # --- 7. **NEW: Privacy Amplification** ---
+        print("\n--- 🔒 Privacy Amplification ---")
+        amplified_key = hashlib.sha256(final_key_str.encode()).hexdigest()
+        
+        print(f"Corrected Key Length: {len(final_key_str)} bits")
+        print(f"**Final Amplified Secure Key (SHA-256): {amplified_key}**")
+        print(f"Final Key Length: 256 bits")
+        print("\nSUCCESS! ✨ Secure key established.")
