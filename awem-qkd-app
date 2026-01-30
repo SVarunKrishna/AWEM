@@ -1,47 +1,31 @@
-# awem_qkd_app.py
-# AWEM-QKD web app with interactive simulation, charts, explanations, and autosave
-# Runs your QAH + QCEL + AWEM + CHSH flow and visualizes QBER, Entropy, S-value
-# Added UI/UX: Loading spinner, gauges, transmission animation
-
 import os, json, math, random, hashlib, numpy as np
 from datetime import datetime
 from scipy.stats import entropy
 from typing import List, Tuple, Dict
-
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
 from dash import Dash, html, dcc, Input, Output, State, callback_context, dash_table
-
 # Qiskit
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 from qiskit_aer.noise import NoiseModel, depolarizing_error
-
-# -----------------------------
 # Config & output directories
-# -----------------------------
 DEFAULT_NUM_BITS = 29
 DEFAULT_NUM_SIMULATIONS = 5
 DEFAULT_ENABLE_EVE = True
 DEFAULT_MAX_RETRIES = 3
-
 OUTPUT_DIR = "simulation_outputs"
 CHART_DIR = os.path.join(OUTPUT_DIR, "charts")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CHART_DIR, exist_ok=True)
-
-# Detect kaleido availability (for PNG export)
+# kaleido availability (for PNG export)
 try:
     import kaleido  # noqa: F401
     KALEIDO_OK = True
 except Exception:
     KALEIDO_OK = False
-
-# -----------------------------
 # Noise model (same as your code)
-# -----------------------------
 def make_noise_model(single_p=0.005, two_p=0.01):
     noise_model = NoiseModel()
     single_qubit_error = depolarizing_error(single_p, 1)
@@ -49,65 +33,49 @@ def make_noise_model(single_p=0.005, two_p=0.01):
     noise_model.add_all_qubit_quantum_error(single_qubit_error, ['h', 'x'])
     noise_model.add_all_qubit_quantum_error(two_qubit_error, ['cx'])
     return noise_model
-
-# -----------------------------
 # Utilities
-# -----------------------------
 def generate_random_bits(n): return [random.randint(0, 1) for _ in range(n)]
 def generate_random_bases(n): return [random.choice(['Z', 'X']) for _ in range(n)]
 def mark_decoys(bits, p=0.1): return [random.random() < p for _ in bits]
-
 def apply_qah(qc, bits, bases, num_bits):
     for i in range(num_bits):
         if bits[i] == 1: qc.x(i)
         if bases[i] == 'X': qc.h(i)
-
 def apply_qcel(qc, num_bits):
     for i in range(1, num_bits):
         qc.cx(0, i)
-
 def insert_eavesdropper(qc, eve_bases, num_bits):
     for i in range(num_bits):
         if eve_bases[i] == 'X': qc.h(i)
         qc.measure(i, i)
         qc.reset(i)
         if eve_bases[i] == 'X': qc.h(i)
-
 def apply_measurement(qc, bases, num_bits):
     for i in range(num_bits):
         if bases[i] == 'X': qc.h(i)
         qc.measure(i, i)
-
 def awem_filter(alice, bob):
     return [a for a, b in zip(alice, bob) if a == b]
-
 def logic_gate_filter(alice, bob):
     return ([a ^ b for a, b in zip(alice, bob)],
             [a & b for a, b in zip(alice, bob)],
             [a | b for a, b in zip(alice, bob)])
-
 def sha256_amplify(key):
     digest = hashlib.sha256(''.join(map(str, key)).encode()).hexdigest()
     return [int(b) for b in bin(int(digest, 16))[2:].zfill(256)]
-
 def qber(alice, bob):
     return (sum(a != b for a, b in zip(alice, bob)) / len(alice)) if alice else 1.0
-
 def shannon_entropy(bits):
     if len(bits) == 0:
         return 0.0
     p = [bits.count(x)/len(bits) for x in set(bits)]
     return entropy(p, base=2)
-
-# -----------------------------
 # Cascade: realistic simulated Cascade-style error correction
-# -----------------------------
 def _parity(bits: List[int], indices: List[int]) -> int:
     p = 0
     for i in indices:
         p ^= bits[i]
     return p
-
 def _bisect_fix(alice: List[int], bob: List[int], indices: List[int]) -> int:
     lo = 0
     hi = len(indices) - 1
@@ -123,7 +91,6 @@ def _bisect_fix(alice: List[int], bob: List[int], indices: List[int]) -> int:
     flip_pos = indices[lo]
     bob[flip_pos] ^= 1
     return flip_pos
-
 def cascade_correct(alice: List[int], bob: List[int],
                     max_passes: int = 4,
                     initial_block_size: int | None = None,
@@ -136,24 +103,19 @@ def cascade_correct(alice: List[int], bob: List[int],
     """
     if len(alice) != len(bob):
         raise ValueError("Alice and Bob bit lists must have the same length for Cascade.")
-
     n = len(alice)
     if n == 0:
         return bob[:], {"corrections": 0, "positions": [], "passes": 0, "final_qber": 0.0}
-
     rng = random.Random(seed)
     corrected_bob = bob[:]  # copy
     total_corrections = 0
     correction_positions = []
-
     if initial_block_size is None:
         initial_block_size = max(1, n // (2 ** (max_passes - 1))) if max_passes > 1 else max(1, n // 2)
-
     for p in range(max_passes):
         # random permutation for this pass
         perm = list(range(n))
         rng.shuffle(perm)
-
         block_size = initial_block_size * (2 ** p)
         block_size = max(1, min(block_size, n))
         blocks = [perm[i:i + block_size] for i in range(0, n, block_size)]
@@ -180,9 +142,7 @@ def cascade_correct(alice: List[int], bob: List[int],
     }
     return corrected_bob, stats
 
-# -----------------------------
 # CHSH (same as your code)
-# -----------------------------
 def chsh_measure_circuit(angle_a, angle_b):
     qc = QuantumCircuit(2, 2)
     qc.h(0); qc.cx(0, 1)
@@ -217,10 +177,7 @@ def chsh_test_on_circuit(noise_model):
     }
     S = abs(E['A0B0'] + E['A0B1'] + E['A1B0'] - E['A1B1'])
     return round(S, 4)
-
-# -----------------------------
 # Core simulation (adapted to be parametric)
-# -----------------------------
 def run_one_awem_qkd_sim(run_id, num_bits, enable_eve, max_retries, noise_model):
     retry = 0
     while retry < max_retries:
@@ -296,10 +253,7 @@ def run_all_sims(num_sims, num_bits, enable_eve, max_retries, single_p, two_p):
         with open(per_run_path, "w") as jf:
             json.dump(rec, jf, indent=4)
     return records
-
-# -----------------------------
 # Visualization helpers
-# -----------------------------
 def make_summary_df(records):
     if not records:
         return pd.DataFrame()
@@ -354,10 +308,7 @@ def save_pngs(figs_with_names):
         except Exception as e:
             messages.append(f"Failed to save {name}: {e}")
     return "\n".join(messages) if messages else "No figures to save."
-
-# -----------------------------
 # Dash App UI
-# -----------------------------
 app = Dash(__name__, suppress_callback_exceptions=True)
 app.title = "AWEM-QKD Demo"
 
@@ -482,10 +433,7 @@ app.layout = html.Div([
 
     html.Div(id="save_msg", style={"whiteSpace": "pre-wrap", "color": "#226622", "fontStyle": "italic", "marginTop": "8px"})
 ], style={"maxWidth": "1200px", "margin": "0 auto", "fontFamily": "system-ui, -apple-system, Segoe UI, Roboto, Arial"})
-
-# -----------------------------
 # Callbacks
-# -----------------------------
 @app.callback(
     Output("records_store", "data"),
     Output("run_msg", "children"),
@@ -572,10 +520,7 @@ def update_views(records):
     ])
 
     return df.to_dict("records"), summary_bar, metrics, pie, cards, save_report
-
-# -----------------------------
 # New: Gauges callback
-# -----------------------------
 @app.callback(
     Output("gauge_qber", "figure"),
     Output("gauge_entropy", "figure"),
@@ -637,10 +582,7 @@ def update_gauges(records):
     for f in (fig_qber, fig_entropy, fig_s):
         f.update_layout(margin=dict(l=10, r=10, t=40, b=10), height=260)
     return fig_qber, fig_entropy, fig_s
-
-# -----------------------------
 # New: Transmission animation callback (complete)
-# -----------------------------
 @app.callback(
     Output("transmission_anim", "figure"),
     Input("records_store", "data")
@@ -729,10 +671,7 @@ def animate_transmission(records):
         )
     )
     return fig
-
-# -----------------------------
 # Main
-# -----------------------------
 if __name__ == "__main__":
     print("Starting AWEM-QKD web app…")
     print("Open http://127.0.0.1:8050/ in your browser.")
