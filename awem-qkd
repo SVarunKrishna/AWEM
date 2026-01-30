@@ -1,13 +1,9 @@
-# awem_qkd_real_chsh.py
-# AWEM-QKD + Realistic CHSH Violation + Entropy/QBER Logic
-
 import numpy as np, random, json, hashlib, os
 from datetime import datetime
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 from qiskit_aer.noise import NoiseModel, depolarizing_error
 from scipy.stats import entropy
-
 # --- Config ---
 NUM_BITS = 29
 NUM_SIMULATIONS = 5
@@ -15,59 +11,49 @@ ENABLE_EAVESDROPPER = True
 MAX_RETRIES = 3
 OUTPUT_DIR = "simulation_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 # --- Noise Model ---
 noise_model = NoiseModel()
 single_qubit_error = depolarizing_error(0.005, 1)
 two_qubit_error = depolarizing_error(0.01, 2)
 noise_model.add_all_qubit_quantum_error(single_qubit_error, ['h', 'x'])
 noise_model.add_all_qubit_quantum_error(two_qubit_error, ['cx'])
-
 # --- Utils ---
 def generate_random_bits(n): return [random.randint(0, 1) for _ in range(n)]
 def generate_random_bases(n): return [random.choice(['Z', 'X']) for _ in range(n)]
 def mark_decoys(bits, p=0.1): return [random.random() < p for _ in bits]
-
 def sha256_amplify(key):
     digest = hashlib.sha256(''.join(map(str, key)).encode()).hexdigest()
-    return [int(b) for b in bin(int(digest, 16))[2:].zfill(256)]
-
+    return [int(b) for b in bin(int(digest, 16))[2:].zfill(256)
 def qber(alice, bob): return sum(a != b for a, b in zip(alice, bob)) / len(alice) if alice else 1.0
 def shannon_entropy(bits):
     if not bits: return 0.0
     p = [bits.count(x)/len(bits) for x in set(bits)]
     return entropy(p, base=2)
-
 # --- Logic Gates ---
 def apply_qah(qc, bits, bases):
     for i in range(NUM_BITS):
         if bits[i] == 1: qc.x(i)
         if bases[i] == 'X': qc.h(i)
-
 def apply_qcel(qc):
     for i in range(1, NUM_BITS):
         qc.cx(0, i)
-
 def insert_eavesdropper(qc, eve_bases):
     for i in range(NUM_BITS):
         if eve_bases[i] == 'X': qc.h(i)
         qc.measure(i, i)
         qc.reset(i)
         if eve_bases[i] == 'X': qc.h(i)
-
 def apply_measurement(qc, bases):
     for i in range(NUM_BITS):
         if bases[i] == 'X': qc.h(i)
         qc.measure(i, i)
-
 def awem_filter(alice, bob): return [a for a, b in zip(alice, bob) if a == b]
 def logic_gate_filter(alice, bob):
     return ([a ^ b for a, b in zip(alice, bob)],
             [a & b for a, b in zip(alice, bob)],
             [a | b for a, b in zip(alice, bob)])
 def cascade_correct(alice, bob): return [a if a != b else b for a, b in zip(alice, bob)]
-
-# --- Real CHSH ---
+# --- CHSH ---
 def chsh_measure_circuit(angle_a, angle_b):
     qc = QuantumCircuit(2, 2)
     qc.h(0); qc.cx(0,1)
@@ -75,12 +61,10 @@ def chsh_measure_circuit(angle_a, angle_b):
     qc.ry(2*angle_b, 1)
     qc.measure([0,1], [0,1])
     return qc
-
 def chsh_test_on_circuit():
     sim = AerSimulator(noise_model=noise_model)
     shots = 2048
     angles = {'A0': 0, 'A1': np.pi/4, 'B0': np.pi/8, 'B1': -np.pi/8}
-
     def get_corr(angle_a, angle_b):
         qc = chsh_measure_circuit(angle_a, angle_b)
         result = sim.run(transpile(qc, sim), shots=shots).result()
@@ -90,28 +74,23 @@ def chsh_test_on_circuit():
         same = counts.get('00',0) + counts.get('11',0)
         diff = counts.get('01',0) + counts.get('10',0)
         return (same - diff) / total
-
     E00 = get_corr(angles['A0'], angles['B0'])
     E01 = get_corr(angles['A0'], angles['B1'])
     E10 = get_corr(angles['A1'], angles['B0'])
     E11 = get_corr(angles['A1'], angles['B1'])
-
     S = abs(E00 + E01 + E10 - E11)
     return round(S, 4)
-
 # --- Export ---
 def make_json_serializable(obj):
     if isinstance(obj, np.generic): return obj.item()
     elif isinstance(obj, dict): return {k: make_json_serializable(v) for k,v in obj.items()}
     elif isinstance(obj, list): return [make_json_serializable(v) for v in obj]
     return obj
-
 def export_results(run_id, result_dict):
     fn = f"{OUTPUT_DIR}/awem_results_run_{run_id}.json"
     with open(fn, 'w') as jf:
         json.dump(make_json_serializable(result_dict), jf, indent=4)
-    print(f"✅ Results exported: {fn}")
-
+    print(f" Results exported: {fn}")
 # --- Core simulation ---
 def run_awem_qkd_sim(run_id):
     retry = 0
@@ -121,30 +100,24 @@ def run_awem_qkd_sim(run_id):
         bob_bases = generate_random_bases(NUM_BITS)
         eve_bases = generate_random_bases(NUM_BITS) if ENABLE_EAVESDROPPER else []
         decoys = mark_decoys(alice_bits)
-
         qc = QuantumCircuit(NUM_BITS, NUM_BITS)
         apply_qah(qc, alice_bits, alice_bases)
         apply_qcel(qc)
         if ENABLE_EAVESDROPPER: insert_eavesdropper(qc, eve_bases)
         apply_measurement(qc, bob_bases)
-
         sim = AerSimulator(noise_model=noise_model)
         result = sim.run(transpile(qc, sim), shots=1, memory=True).result()
         bob_bits = [int(x) for x in result.get_memory()[0][::-1]]
-
         sifted_alice = [alice_bits[i] for i in range(NUM_BITS) if alice_bases[i] == bob_bases[i] and not decoys[i]]
         sifted_bob   = [bob_bits[i]   for i in range(NUM_BITS) if alice_bases[i] == bob_bases[i] and not decoys[i]]
-
         xor, and_, or_ = logic_gate_filter(sifted_alice, sifted_bob)
         corrected = cascade_correct(sifted_alice, sifted_bob)
         mitigated = awem_filter(sifted_alice, corrected)
         final_key = sha256_amplify(mitigated)
-
         err = qber(sifted_alice, corrected)
         ent = shannon_entropy(corrected)
         s_val = chsh_test_on_circuit()
         passed = err < 0.25 and ent > 0.85 and s_val > 2.0
-
         print(f"\n--- Run #{run_id} Retry {retry} ---")
         print(f"Alice Sifted Key: {sifted_alice}")
         print(f"Bob Sifted Key:   {corrected}")
@@ -152,14 +125,13 @@ def run_awem_qkd_sim(run_id):
         print(f"Mitigated: {mitigated}")
         print(f"Final Key (trunc): {final_key[:32]}...")
         print(f"QBER: {err:.2%} | Entropy: {ent:.3f} | S-value: {s_val}")
-        print("Privacy Passed:", "✅ YES" if passed else "❌ NO")
+        print("Privacy Passed:", "YES" if passed else "NO")
         if not passed:
             reasons = []
             if err >= 0.25: reasons.append("High QBER")
             if ent <= 0.85: reasons.append("Low Entropy")
             if s_val <= 2.0: reasons.append("No Bell Violation")
-            print("⚠ Privacy failed due to:", ", ".join(reasons))
-
+            print("Privacy failed due to:", ", ".join(reasons))
         if passed or retry == MAX_RETRIES - 1:
             export_results(run_id, {
                 "qber": err, "entropy": ent, "s_value": s_val,
@@ -168,11 +140,9 @@ def run_awem_qkd_sim(run_id):
             })
             break
         retry += 1
-
 # --- Main ---
 def run_all():
     for i in range(1, NUM_SIMULATIONS + 1):
         run_awem_qkd_sim(i)
-
 if __name__ == "__main__":
     run_all()
